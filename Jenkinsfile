@@ -9,16 +9,17 @@ node {
     def slacklib = commonlib.slacklib
     commonlib.describeJob("rhcos_sync", """
         <h2>Sync the RHCOS boot images to mirror</h2>
-        http://mirror.openshift.com/pub/openshift-v4/<arch>/dependencies/rhcos/
-        Publishes RHCOS boot images for a particular release so that customers
-        can base their OCP 4 installs on them.
+        <ul><li>http://mirror.openshift.com/pub/openshift-v4/\$ARCH/dependencies/rhcos/</li></ul>
+        Publishes RHCOS boot images for a particular release (according to the
+        installer image manifest) so that customers can base their OCP 4
+        installs on them. Also updates <code>latest</code> directory by default.
 
         Timing: This is only ever run by humans, usually when a new minor
         version / arch is released. It may also be used when there is a
         boot-time bug requiring updated boot images in a version already
         released.
-
-        See <a href="https://mojo.redhat.com/docs/DOC-1216700#jive_content_id_Publish_RHCOS_bootimages" target="_blank">the docs</a>
+        See <a href="https://art-docs.engineering.redhat.com/release/4.y-ga/#publish-rhcos-bootimages" target="_blank">the docs</a>
+        </p>
     """)
 
 
@@ -38,47 +39,47 @@ node {
                 parameterDefinitions: [
                     string(
                         name: 'FROM_RELEASE_TAG',
-                        description: 'Release Image to get RHCOS buildID from ex - 4.8.2-x86_64 or 4.8.0-0.nightly-2021-07-21-150743',
+                        description: 'Release Image tag (or pullspec with a tag) from which to determine RHCOS buildID; for example <b>quay.io/openshift-release-dev/ocp-release:4.12.0-ec.2-aarch64</b> or just <b>4.12.0-ec.2-x86_64</b>',
                         defaultValue: "",
                         trim: true,
                     ),
                     commonlib.ocpVersionParam('OCP_VERSION', '4', ['auto']),
                     string(
                         name: 'OVERRIDE_BUILD',
-                        description: 'ID of the RHCOS build to sync. e.g.: 42.80.20190828.2. This overrides FROM_RELEASE_TAG.',
+                        description: 'ID of the RHCOS build to sync. e.g.: <b>42.80.20190828.2</b>. This overrides what would be inferred from <code>FROM_RELEASE_TAG</code> and requires explicit specifications below too.',
                         defaultValue: "",
                         trim: true,
                     ),
                     choice(
                         name: 'ARCH',
-                        description: 'Which architecture of RHCOS build to look for. Required with OVERRIDE_BUILD',
+                        description: 'Which architecture of RHCOS build to look for. Required with <code>OVERRIDE_BUILD</code>',
                         choices: (["auto"] + commonlib.brewArches),
                     ),
                     string(
                         name: 'OVERRIDE_NAME',
-                        description: 'The release name, like 4.2.0, or 4.2.0-0.nightly-2019-08-28-152644. Required with OVERRIDE_BUILD',
+                        description: 'The release name, like <b>4.2.0</b>, or <b>4.2.0-0.nightly-2019-08-28-152644</b>. Required with <code>OVERRIDE_BUILD</code>',
                         defaultValue: "",
                         trim: true,
                     ),
                     choice(
                         name: 'MIRROR_PREFIX',
-                        description: 'Where to place this release under https://mirror.openshift.com/pub/openshift-v4/ARCH/dependencies/rhcos/. Auto sets to image version for stable releases (example if FROM_RELEASE_TAG is 4.8.4-x86_64 then directory is 4.8), pre-release for all other FROM_RELEASE_TAG values. "auto" cannot be used with OVERRIDE_BUILD',
+                        description: 'Where to place this release under <b><code>https://mirror.openshift.com/pub/openshift-v4/ARCH/dependencies/rhcos/<code></b>. Auto sets to image version for stable releases (example if <code>FROM_RELEASE_TAG</code> is <b>4.8.4-x86_64</b> then directory is <b>4.8</b>), <b>pre-release</b> for all other <code>FROM_RELEASE_TAG</code> values. <b>auto</b> cannot be used with <code>OVERRIDE_BUILD</code>',
                         choices: (['auto' ,'pre-release', 'test'] + commonlib.ocp4Versions),
                     ),
                     string(
                         name: 'SYNC_LIST',
-                        description: 'Instead of figuring out items to sync from meta.json, use this input file.\nMust be a URL reachable from buildvm',
+                        description: 'Instead of figuring out items to sync from meta.json, use this input file.<br>Must be a URL reachable from buildvm',
                         defaultValue: "",
                         trim: true,
                     ),
                     booleanParam(
                         name: 'FORCE',
-                        description: 'Download (overwrite) and mirror items even if the destination directory already exists\nErases everything already in the target destination.',
+                        description: 'Download (overwrite) and mirror items even if the destination directory already exists<br>Erases everything already in the target destination.',
                         defaultValue: false,
                     ),
                     booleanParam(
                         name: 'NO_LATEST',
-                        description: 'Do not update the "latest" symlink after downloading',
+                        description: 'Do not update the <b>latest</b> symlink after downloading',
                         defaultValue: false,
                     ),
                     booleanParam(
@@ -119,11 +120,21 @@ node {
         }
 
         tag = params.FROM_RELEASE_TAG
-        if (params.OVERRIDE_NAME != "") {
-            name = params.OVERRIDE_NAME
-        } else {
-            name = tag
+        image = "quay.io/openshift-release-dev/ocp-release:${tag}"
+        if (tag.contains("/")) {
+            // assume instead of a tag it's a pullspec e.g. to registry.ci
+            if (!tag.contains(":")) error("FROM_RELEASE_TAG pullspec must include a :tag")
+            image = tag
+            tag = tag.split(":")[-1]
         }
+
+        if (params.OVERRIDE_NAME != "")
+            name = params.OVERRIDE_NAME
+        else
+            name = commonlib.shell(
+                returnStdout: true,
+                script: "oc adm release info -o template --template '{{ .metadata.version }}' ${image}"
+            )
 
         (major, minor) = commonlib.extractMajorMinorVersionNumbers(tag)
         ocpVersion = "$major.$minor"
@@ -131,7 +142,12 @@ node {
         (arch, priv) = releaselib.getReleaseTagArchPriv(tag)
         suffix = releaselib.getArchPrivSuffix(arch, priv)
 
-        cmd = "oc image info -o json \$(oc adm release info --image-for machine-os-content registry.ci.openshift.org/ocp$suffix/release$suffix:$tag) | jq -r .config.config.Labels.version"
+        cmd = """
+            tmp=\$(mktemp -d /tmp/tmp.XXXXXX)
+            oc image extract --path /manifests/:\$tmp \$(oc adm release info --image-for installer ${image})
+            cat \$tmp/coreos-bootimages.yaml | yq -r .data.stream | jq -r .architectures.${arch}.artifacts.qemu.release
+            rm -rf \$tmp
+        """
         rhcosBuild =  commonlib.shell(
             returnStdout: true,
             script: cmd
